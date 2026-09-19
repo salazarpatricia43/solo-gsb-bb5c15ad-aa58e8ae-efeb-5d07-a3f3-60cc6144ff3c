@@ -3,10 +3,11 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, Query, Response, status
+from fastapi import FastAPI, Path, Query, Response, status
 
 from . import ledger
 from .db import init_db
+from .routing import OpaqueIdRoute
 from .schemas import (
     CorrectionForksOut,
     EventBatchIn,
@@ -43,6 +44,12 @@ app = FastAPI(
     ),
     lifespan=lifespan,
 )
+
+# Match routes against the raw (percent-encoded) request path so opaque
+# ids — including ids containing "/" or spelled like a static route such
+# as "changes" — stay addressable through path parameters once the client
+# URL-encodes them. Literal requests keep hitting the literal routes.
+app.router.route_class = OpaqueIdRoute
 
 
 @app.get("/health")
@@ -148,8 +155,21 @@ def get_event_changes(
     return ledger.event_changes(from_revision, to_revision)
 
 
-@app.get("/events/{event_id}", response_model=EventOut)
-def get_event(event_id: str) -> EventOut:
+@app.get(
+    "/events/{event_id}",
+    response_model=EventOut,
+    responses={404: {"description": "No event stored under this event_id"}},
+)
+def get_event(
+    event_id: str = Path(
+        description=(
+            "Opaque event id, exactly as stored. URL-encode reserved "
+            "characters ('/' as '%2F'); an id spelled like a literal route "
+            "(e.g. 'changes') must be requested with at least one "
+            "percent-encoded character (e.g. '%63hanges')."
+        ),
+    ),
+) -> EventOut:
     return ledger.get_event(event_id)
 
 
@@ -256,7 +276,12 @@ def get_leaderboard_commitment(
     },
 )
 def get_leaderboard_proof(
-    participant_id: str,
+    participant_id: str = Path(
+        description=(
+            "Opaque participant id, exactly as stored; URL-encode reserved "
+            "characters ('/' as '%2F')."
+        ),
+    ),
     revision: Optional[int] = Query(
         default=None,
         ge=0,
@@ -300,7 +325,12 @@ def get_participant_compare(
     },
 )
 def get_score_breakdown(
-    participant_id: str,
+    participant_id: str = Path(
+        description=(
+            "Opaque participant id, exactly as stored; URL-encode reserved "
+            "characters ('/' as '%2F')."
+        ),
+    ),
     revision: Optional[int] = Query(
         default=None,
         ge=0,
@@ -322,7 +352,12 @@ def get_score_breakdown(
     },
 )
 def get_threshold_intervals(
-    participant_id: str,
+    participant_id: str = Path(
+        description=(
+            "Opaque participant id, exactly as stored; URL-encode reserved "
+            "characters ('/' as '%2F')."
+        ),
+    ),
     threshold: int = Query(description="Inclusive total-points threshold (any integer)."),
     from_revision: int = Query(
         description="Earlier revision; 0 means the empty ledger.",

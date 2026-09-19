@@ -13,6 +13,7 @@
 - **积分阈值区间**：`GET /participants/{participant_id}/threshold-intervals` 逐 revision 重算单个参赛者的真实生效总分，把"总分 ≥ 阈值"的连续 revision 合并为闭区间，返回区间起止与两端积分；更正链分叉、跨参赛者更正造成的升降都会体现，未出现的参赛者按 0 分处理。
 - **排行榜快照承诺**：`GET /leaderboard/commitment?revision=` 对榜单按序做确定性编码（rank、participant_id、total_points、生效 event_id 列表），构建 SHA-256 Merkle 树并返回叶数与根摘要；`GET /leaderboard/proof/{participant_id}?revision=` 返回条目、叶索引与逐层兄弟节点，客户端可独立复算同一根。奇数层末节点与自身配对，单叶树根即叶哈希，空榜根固定为 `SHA256("")`，缺席参赛者返回 404。历史快照只依赖该 revision 及之前的事件，不受后续写入影响。
 - **并发安全**：写入经 `BEGIN IMMEDIATE` 串行化，revision 在写锁内分配——并发写入（含批量）不会产生重复 revision 或中间态。
+- **不透明 ID 回读**：`event_id` / `participant_id` 可含 `/`、`%`、多字节字符，甚至与静态路由同名（如 `changes`）；经 URL 百分号编码后，所有路径参数接口都能精确回读（见[路径中的不透明 ID](#路径中的不透明-idurl-编码)）。
 
 ## 快速启动
 
@@ -664,13 +665,36 @@ curl localhost:8000/audit/correction-forks
 
 空账本或 `revision=0` 返回 `{"revision": 0, "forks": []}`；快照中尚不存在分叉（例如分叉的第二个分支写入之前）时 `forks` 同样为空。
 
+### 路径中的不透明 ID（URL 编码）
+
+`event_id` 与 `participant_id` 都是不透明字符串：可以包含 `/`、`%`、空格、多字节字符，也可以恰好等于某个静态路由名（如 `changes`、`compare`）。写入接口照单全收；通过**路径参数**回读时，客户端需对 ID 做 URL 百分号编码：
+
+- 含 `/` 的 ID 把每个 `/` 编码为 `%2F`，整体仍占一个路径段：`GET /events/a%2Fb` 精确读取 `event_id = "a/b"`；
+- 与静态路由同名的 ID：字面路径永远归属静态接口（`/events/changes`、`/participants/compare` 等行为不变），读取同名记录时把任一字符百分号编码即可，如 `GET /events/%63hanges` 读取 `event_id = "changes"`；
+- 多字节字符按其 UTF-8 字节编码（如 `张三` → `%E5%BC%A0%E4%B8%89`），`%` 本身编码为 `%25`。
+
+同一规则适用于所有携带路径参数的接口：
+
+```bash
+# event_id = "a/b"，participant_id = "p/1"
+curl localhost:8000/events/a%2Fb
+curl 'localhost:8000/participants/p%2F1/score-breakdown'
+curl 'localhost:8000/participants/p%2F1/threshold-intervals?threshold=10&from_revision=0&to_revision=5'
+curl 'localhost:8000/leaderboard/proof/p%2F1'
+
+# event_id = "changes"（与静态路由同名，编码任一字符即可命中事件查询）
+curl localhost:8000/events/%63hanges
+```
+
+未编码的字面请求行为保持不变；编码后仍不存在的 ID 返回 `404`。
+
 ### 其他端点
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/events` | 全部事件（按 revision 升序） |
-| `GET` | `/events/{event_id}` | 单个事件 |
+| `GET` | `/events/{event_id}` | 单个事件（`event_id` 需 URL 编码，见上节） |
 
 ## 配置
 
@@ -696,11 +720,12 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest -v
 ```
 
-测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空账本对比、更正合并为 `replaced`、链分叉记 `added`、非一进一出不合并、before/after 完整事件、按链根排序、参数顺序 422、超范围 404、路由不被 `/events/{event_id}` 遮蔽），`/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续），以及 `/participants/{participant_id}/score-breakdown`（空账本与未知参赛者返回 0 与空数组、更正链只计末端且 history 完整、历史 revision 固定快照、revision 0 空快照、更正转移后旧参赛者不再保留该链而新归属者 history 展示此前归属、按链根升序、分叉链每末端各成一项、总分与 `/leaderboard` 一致、默认取当前 revision、负数 422、超范围 404），以及 `/participants/compare`（区间合并与边界、子范围与 `from == to`、更正改挂在同一 revision 双方同时变动、更正链只计末端、分叉链只扣一次、双方无分/未知参赛者返回覆盖全范围的 tie、双方同一人恒为 tie、空账本 0→0、区间无缝覆盖整个范围、逐 revision 与 `/leaderboard` 总分一致、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、字面路由不被遮蔽），以及 `/participants/{participant_id}/threshold-intervals`（区间合并与边界含等号、区间两端积分可不同、子范围与 `from == to`、阈值为负/0 与 revision 0、未出现参赛者按 0 分、跨参赛者更正使旧归属方跌出新归属方升入、更正链只计末端、分叉链各分支叶子均计且共享祖先只扣一次、逐 revision 与 `/leaderboard` 总分一致、区间按起点升序、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、查询只读不写账本），以及 `/rewards/preview`（空账本返回空获奖者、按名次发奖、并列组合并奖金池均分、余数分币按 `participant_id` 升序分配且总额守恒、组跨有奖区边界只合并区内名次、区外组不获奖、0 奖金名次仍在区内、指定历史 revision 快照、更正链只计末端、越界 revision 返回 404、奖金数组 1～100 个非负整数校验 422、预演不写入账本），以及 `/audit/correction-forks`（空账本与 revision 0 返回空、普通线性链与独立事件不返回、分叉列出各分支根到生效叶子的完整路径、分叉后的链式更正归入各自分支、非根节点分叉与多个分叉点共享链根、按参赛者汇总生效积分且被取代节点不计、历史 revision 固定快照、分叉形成前后的快照差异、`chain_root` 与叶子 `(revision, event_id)` 稳定排序、批量写入的分叉可见、默认最新、超范围 404、负数/非整数 422、只读不写账本），以及 `/events/preview`（空账本基线推演、虚拟 revision 与草案生效明细、基线固定快照忽略后续账本事件、base_revision 0 忽略全账本、草案更正基线事件只计末端、批内草案链式更正、草案分叉基线链保留各分支叶子、更正改挂产生退出/进入、并列按 `participant_id` 排序且名次连续、仅名次变化与无变化空 changes、与基线及基线后账本事件重名 409、409 先于 422、引用后续草案/未知事件/基线后账本事件/自引用 422、批内重复 422、越界基线 404、负数/非整数/缺参 422、草案条数 1～100 校验、预演不写库不耗 revision、推演结果与真实写入后的 `/leaderboard` 及 `/leaderboard/changes` 一致），以及 `/leaderboard/commitment` 与 `/leaderboard/proof/{participant_id}`（空榜根固定为 `SHA256("")` 且叶数为 0、空榜任何参赛者 404、叶序等于排名顺序、叶数与 revision 字段、默认取最新 revision、叶索引等于 rank-1、proof 的 entry 与 `/leaderboard` 一致、用独立实现的编码逐层复算每个参赛者的根、奇数层末节点与自身配对（3/5 叶）、各 `position`（left/right/self）与层级兄弟摘要布局、单叶树根即叶哈希且 proof 为空、两叶树无 self 步、UTF-8 参赛者 ID 的载荷编码、缺席/未出生参赛者 404、更正后生效 event_id 与根变化、历史快照在后续写入（含更正改挂）后根与证明保持不变、每个 revision 两接口一致、超范围 404 与负数/非整数 422）。
+测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空账本对比、更正合并为 `replaced`、链分叉记 `added`、非一进一出不合并、before/after 完整事件、按链根排序、参数顺序 422、超范围 404、路由不被 `/events/{event_id}` 遮蔽），`/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续），以及 `/participants/{participant_id}/score-breakdown`（空账本与未知参赛者返回 0 与空数组、更正链只计末端且 history 完整、历史 revision 固定快照、revision 0 空快照、更正转移后旧参赛者不再保留该链而新归属者 history 展示此前归属、按链根升序、分叉链每末端各成一项、总分与 `/leaderboard` 一致、默认取当前 revision、负数 422、超范围 404），以及 `/participants/compare`（区间合并与边界、子范围与 `from == to`、更正改挂在同一 revision 双方同时变动、更正链只计末端、分叉链只扣一次、双方无分/未知参赛者返回覆盖全范围的 tie、双方同一人恒为 tie、空账本 0→0、区间无缝覆盖整个范围、逐 revision 与 `/leaderboard` 总分一致、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、字面路由不被遮蔽），以及 `/participants/{participant_id}/threshold-intervals`（区间合并与边界含等号、区间两端积分可不同、子范围与 `from == to`、阈值为负/0 与 revision 0、未出现参赛者按 0 分、跨参赛者更正使旧归属方跌出新归属方升入、更正链只计末端、分叉链各分支叶子均计且共享祖先只扣一次、逐 revision 与 `/leaderboard` 总分一致、区间按起点升序、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、查询只读不写账本），以及 `/rewards/preview`（空账本返回空获奖者、按名次发奖、并列组合并奖金池均分、余数分币按 `participant_id` 升序分配且总额守恒、组跨有奖区边界只合并区内名次、区外组不获奖、0 奖金名次仍在区内、指定历史 revision 快照、更正链只计末端、越界 revision 返回 404、奖金数组 1～100 个非负整数校验 422、预演不写入账本），以及 `/audit/correction-forks`（空账本与 revision 0 返回空、普通线性链与独立事件不返回、分叉列出各分支根到生效叶子的完整路径、分叉后的链式更正归入各自分支、非根节点分叉与多个分叉点共享链根、按参赛者汇总生效积分且被取代节点不计、历史 revision 固定快照、分叉形成前后的快照差异、`chain_root` 与叶子 `(revision, event_id)` 稳定排序、批量写入的分叉可见、默认最新、超范围 404、负数/非整数 422、只读不写账本），以及 `/events/preview`（空账本基线推演、虚拟 revision 与草案生效明细、基线固定快照忽略后续账本事件、base_revision 0 忽略全账本、草案更正基线事件只计末端、批内草案链式更正、草案分叉基线链保留各分支叶子、更正改挂产生退出/进入、并列按 `participant_id` 排序且名次连续、仅名次变化与无变化空 changes、与基线及基线后账本事件重名 409、409 先于 422、引用后续草案/未知事件/基线后账本事件/自引用 422、批内重复 422、越界基线 404、负数/非整数/缺参 422、草案条数 1～100 校验、预演不写库不耗 revision、推演结果与真实写入后的 `/leaderboard` 及 `/leaderboard/changes` 一致），以及 `/leaderboard/commitment` 与 `/leaderboard/proof/{participant_id}`（空榜根固定为 `SHA256("")` 且叶数为 0、空榜任何参赛者 404、叶序等于排名顺序、叶数与 revision 字段、默认取最新 revision、叶索引等于 rank-1、proof 的 entry 与 `/leaderboard` 一致、用独立实现的编码逐层复算每个参赛者的根、奇数层末节点与自身配对（3/5 叶）、各 `position`（left/right/self）与层级兄弟摘要布局、单叶树根即叶哈希且 proof 为空、两叶树无 self 步、UTF-8 参赛者 ID 的载荷编码、缺席/未出生参赛者 404、更正后生效 event_id 与根变化、历史快照在后续写入（含更正改挂）后根与证明保持不变、每个 revision 两接口一致、超范围 404 与负数/非整数 422），以及不透明 ID 回读（含 `/` 的 `event_id`/`participant_id` 经 `%2F` 编码后精确查询事件、积分归因、阈值区间与默克尔证明、与静态路由同名的 `event_id` 经百分号编码回读且 `/events/changes`、`/participants/compare` 字面行为不变、含 `%`/空格/多字节字符的 ID、带斜杠 ID 的更正链、编码后不存在仍 404）。
 
 ## 设计要点
 
 - **存储**：单表 `events`（`event_id` 主键，`revision` 唯一），WAL 模式。
+- **不透明 ID 路由**：`app/routing.py` 的 `OpaqueIdRoute` 让全部路由针对**原始（未解码）路径**匹配、匹配后再对路径参数做百分号解码：`%2F` 在原始路径中不是字面 `/`，因此 `{event_id}` 单段模式可以跨越它并解码出 `a/b`；`/events/%63hanges` 不匹配字面量 `/events/changes`，于是落到 `/events/{event_id}` 并解码出 `changes`。字面请求仍命中字面路由，静态接口（`/events/changes`、`/participants/compare` 等）行为完全不变。
 - **幂等**：请求载荷序列化为规范化 JSON（键排序）随事件存储；重放时比对，一致返回原结果，不一致返回 409。批量接口仅当全部 `event_id` 均已存在且逐项一致时按原结果返回 200；部分已存在或任一异载荷返回 409。
 - **批量原子性**：`/events/batch` 在单个 `BEGIN IMMEDIATE` 事务内完成重复/冲突检查、引用校验与全部插入；`correction_of` 仅可指向库中事件或同批更早下标。revision 取锁内 `MAX(revision)+1` 后按数组顺序连续分配，任何失败均回滚，不留下事件也不消耗 revision。
 - **生效判定**：revision R 上事件 e 生效 ⟺ `e.revision ≤ R` 且不存在 `c.revision ≤ R` 的更正事件 `c.correction_of = e.event_id`。
