@@ -3,10 +3,11 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, Query, Response, status
+from fastapi import APIRouter, FastAPI, Path, Query, Response, status
 
 from . import ledger
 from .db import init_db
+from .routing import EncodedPathRoute
 from .schemas import (
     CorrectionForksOut,
     EventBatchIn,
@@ -43,6 +44,16 @@ app = FastAPI(
     ),
     lifespan=lifespan,
 )
+
+
+# Routes that carry an opaque ID in the path — plus the static routes those
+# IDs could be confused with — match the raw, still percent-encoded request
+# path (see app/routing.py). Any writable ID (containing "/", or equal to a
+# static route name such as "changes"/"compare") then round-trips through
+# URL encoding, while the static routes keep matching literally. Within this
+# router, declaration order matters: static literals come before the dynamic
+# patterns they share a prefix with.
+id_router = APIRouter(route_class=EncodedPathRoute)
 
 
 @app.get("/health")
@@ -126,8 +137,10 @@ def get_events() -> List[EventOut]:
     return ledger.list_events()
 
 
-# NOTE: declared before /events/{event_id} so the literal path wins.
-@app.get(
+# NOTE: declared before /events/{event_id} so the literal path wins. The
+# event literally named "changes" stays readable via URL encoding, e.g.
+# GET /events/%63hanges (see app/routing.py).
+@id_router.get(
     "/events/changes",
     response_model=EventChangesOut,
     responses={
@@ -148,8 +161,21 @@ def get_event_changes(
     return ledger.event_changes(from_revision, to_revision)
 
 
-@app.get("/events/{event_id}", response_model=EventOut)
-def get_event(event_id: str) -> EventOut:
+@id_router.get(
+    "/events/{event_id}",
+    response_model=EventOut,
+    responses={404: {"description": "event_id not found"}},
+)
+def get_event(
+    event_id: str = Path(
+        description=(
+            "Opaque event ID. URL-encode reserved characters: '/' as %2F, "
+            "'%' as %25, non-ASCII as UTF-8 percent-encoding. An ID equal "
+            "to a static route name (e.g. 'changes') is read back by "
+            "encoding at least one character, e.g. /events/%63hanges."
+        )
+    ),
+) -> EventOut:
     return ledger.get_event(event_id)
 
 
@@ -242,7 +268,7 @@ def get_leaderboard_commitment(
     return ledger.leaderboard_commitment(revision)
 
 
-@app.get(
+@id_router.get(
     "/leaderboard/proof/{participant_id}",
     response_model=LeaderboardProofOut,
     responses={
@@ -256,7 +282,12 @@ def get_leaderboard_commitment(
     },
 )
 def get_leaderboard_proof(
-    participant_id: str,
+    participant_id: str = Path(
+        description=(
+            "Opaque participant ID. URL-encode reserved characters: '/' as "
+            "%2F, '%' as %25, non-ASCII as UTF-8 percent-encoding."
+        )
+    ),
     revision: Optional[int] = Query(
         default=None,
         ge=0,
@@ -268,7 +299,7 @@ def get_leaderboard_proof(
 
 # NOTE: declared before /participants/{participant_id}/... so the literal
 # path keeps winning even if a /participants/{participant_id} route appears.
-@app.get(
+@id_router.get(
     "/participants/compare",
     response_model=ParticipantCompareOut,
     responses={
@@ -291,7 +322,7 @@ def get_participant_compare(
     return ledger.participant_compare(left_id, right_id, from_revision, to_revision)
 
 
-@app.get(
+@id_router.get(
     "/participants/{participant_id}/score-breakdown",
     response_model=ScoreBreakdownOut,
     responses={
@@ -300,7 +331,12 @@ def get_participant_compare(
     },
 )
 def get_score_breakdown(
-    participant_id: str,
+    participant_id: str = Path(
+        description=(
+            "Opaque participant ID. URL-encode reserved characters: '/' as "
+            "%2F, '%' as %25, non-ASCII as UTF-8 percent-encoding."
+        )
+    ),
     revision: Optional[int] = Query(
         default=None,
         ge=0,
@@ -311,7 +347,7 @@ def get_score_breakdown(
     return ledger.score_breakdown(participant_id, revision)
 
 
-@app.get(
+@id_router.get(
     "/participants/{participant_id}/threshold-intervals",
     response_model=ThresholdIntervalsOut,
     responses={
@@ -322,7 +358,12 @@ def get_score_breakdown(
     },
 )
 def get_threshold_intervals(
-    participant_id: str,
+    participant_id: str = Path(
+        description=(
+            "Opaque participant ID. URL-encode reserved characters: '/' as "
+            "%2F, '%' as %25, non-ASCII as UTF-8 percent-encoding."
+        )
+    ),
     threshold: int = Query(description="Inclusive total-points threshold (any integer)."),
     from_revision: int = Query(
         description="Earlier revision; 0 means the empty ledger.",
@@ -348,3 +389,8 @@ def get_threshold_intervals(
 )
 def post_rewards_preview(preview: RewardPreviewIn) -> RewardPreviewOut:
     return ledger.rewards_preview(preview)
+
+
+# Mounted last: none of its paths overlap the app-level routes above, and
+# its internal static-before-dynamic order is preserved on inclusion.
+app.include_router(id_router)
